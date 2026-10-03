@@ -33,7 +33,7 @@ cd nnos
 Build the kernel and bootable ISO:
 
 ```bash
-make
+make iso
 ```
 
 This generates:
