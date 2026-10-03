@@ -38,7 +38,7 @@ make
 
 This generates:
 
-* `kernel.bin` — the NNOS kernel
+* `kernel.bin` — the nnos kernel
 * `nnos.iso` — bootable ISO image
 
 ### Run with QEMU
@@ -57,4 +57,4 @@ This removes the generated object files, kernel, ISO, and `iso_root/` directory.
 
 ## License
 
-NNOS is licensed under the GNU General Public License v3.0.
+nnos is licensed under the GNU General Public License v3.0.
