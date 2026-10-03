@@ -4,6 +4,7 @@ extern void print_char(char c);
 extern void cls(void);
 extern void disable_cursor(void);
 extern void echo(const char* input);
+extern void help_c();
 
 #define HISTORY_SIZE 10
 #define INPUT_SIZE 64
@@ -133,6 +134,14 @@ void init_c()
                      input[4] == ' ')
             {
                 echo(input);
+            }
+            else if (strcmp(input, "ver") == 0)
+            {
+                print("\nnnos Kernel v0.0.1");
+            }
+            else if (strcmp(input, "help") == 0)
+            {
+                help_c();
             }
             else
             {
