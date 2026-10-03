@@ -6,7 +6,7 @@ A small x86 operating system written in C and Assembly.
 
 - VGA text mode output
 
-- PS/2 Keyboard input
+- PS/2 keyboard input
 
 - Basic shell
 
