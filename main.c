@@ -143,6 +143,10 @@ void init_c()
             {
                 help_c();
             }
+            else if (strcmp(input, "EASTERegg") == 0)
+            {
+                print("\nnnos is the best...");
+            }
             else
             {
                 print("\nUnknown command");
