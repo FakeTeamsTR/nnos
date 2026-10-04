@@ -45,6 +45,12 @@ char input_api(void)
             if (scancode == 0x50)
                 return KEY_DOWN;
 
+            if (scancode == 0x4B)
+                return KEY_LEFT;
+
+            if (scancode == 0x4D)
+                return KEY_RIGHT;
+
             continue;
         }
 

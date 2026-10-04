@@ -100,3 +100,9 @@ void print_char(char c)
             cls();
     }
 }
+
+void set_cursor_position(int x, int y)
+{
+    cursor_x = x;
+    cursor_y = y;
+}
