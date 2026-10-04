@@ -2,6 +2,8 @@
 #define VGA_WIDTH   80
 #define VGA_HEIGHT  25
 
+extern void cls(void);
+
 int cursor_x = 0;
 int cursor_y = 0;
 
@@ -15,6 +17,9 @@ void print(const char* str)
         {
             cursor_x = 0;
             cursor_y++;
+
+            if (cursor_y >= VGA_HEIGHT)
+                cls();
         }
         else
         {
@@ -29,6 +34,9 @@ void print(const char* str)
             {
                 cursor_x = 0;
                 cursor_y++;
+
+                if (cursor_y >= VGA_HEIGHT)
+                    cls();
             }
         }
 
@@ -44,18 +52,34 @@ void print_char(char c)
     {
         cursor_x = 0;
         cursor_y++;
+
+        if (cursor_y >= VGA_HEIGHT)
+            cls();
+
         return;
     }
 
     if (c == '\b')
     {
         if (cursor_x > 0)
+        {
             cursor_x--;
 
-        int pos = (cursor_y * VGA_WIDTH + cursor_x) * 2;
+            int pos = (cursor_y * VGA_WIDTH + cursor_x) * 2;
 
-        video[pos] = ' ';
-        video[pos + 1] = 0x07;
+            video[pos] = ' ';
+            video[pos + 1] = 0x07;
+        }
+        else if (cursor_y > 0)
+        {
+            cursor_y--;
+            cursor_x = VGA_WIDTH - 1;
+
+            int pos = (cursor_y * VGA_WIDTH + cursor_x) * 2;
+
+            video[pos] = ' ';
+            video[pos + 1] = 0x07;
+        }
 
         return;
     }
@@ -71,5 +95,8 @@ void print_char(char c)
     {
         cursor_x = 0;
         cursor_y++;
+
+        if (cursor_y >= VGA_HEIGHT)
+            cls();
     }
 }

@@ -7,7 +7,7 @@ CFLAGS   = -m32 -ffreestanding -nostdlib -nostartfiles -nodefaultlibs -c
 LDFLAGS  = -m elf_i386 -T linker.ld
 
 SRC_ASM  = entry.asm asmtoc.asm
-SRC_C    = main.c print.c input.c cls.c disablecursor.c echo.c help.c
+SRC_C    = main.c print.c input.c cls.c disablecursor.c echo.c help.c clhis.c
 OBJ      = $(SRC_ASM:.asm=.o) $(SRC_C:.c=.o)
 
 KERNEL   = kernel.bin

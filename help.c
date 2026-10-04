@@ -7,5 +7,6 @@ void help_c() {
     print("echo      Print text\n");
     print("ver       Show kernel version\n");
     print("shutdown  Shutdown the computer\n");
+    print("clhis     Clear the history\n");
     print("help      Show this help message\n");
 }

@@ -5,9 +5,10 @@ extern void cls(void);
 extern void disable_cursor(void);
 extern void echo(const char* input);
 extern void help_c();
+extern void clhis(void);
 
 #define HISTORY_SIZE 10
-#define INPUT_SIZE 64
+#define INPUT_SIZE 256
 
 #include "input.h"
 
@@ -146,6 +147,11 @@ void init_c()
             else if (strcmp(input, "EASTERegg") == 0)
             {
                 print("\nnnos is the best...");
+            }
+            else if (strcmp(input, "clhis") == 0)
+            {
+                clhis();
+                print("\nHistory cleared.");
             }
             else
             {
