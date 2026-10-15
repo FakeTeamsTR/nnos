@@ -3,6 +3,7 @@
 #include "input.h"
 #include "disk.h"
 #include "mbr.h"
+#include "vfs.h"
 
 extern void print(const char* str);
 extern char input_api(void);
@@ -35,6 +36,7 @@ int input_start_x = 0;
 int input_start_y = 0;
 
 static uint8_t selected_disk = 0;
+static char current_directory[INPUT_SIZE];
 
 int strcmp(const char* a, const char* b)
 {
@@ -122,6 +124,174 @@ static int parse_confirmation(const char** p)
 
     *p += sizeof(token) - 1;
     return **p == '\0' || **p == ' ';
+}
+
+static int parse_token(const char** p, char* output, uint32_t capacity)
+{
+    uint32_t length = 0;
+
+    skip_spaces(p);
+    if (**p == '\0' || capacity == 0)
+        return 0;
+
+    while (**p != '\0' && **p != ' ')
+    {
+        if (length + 1 >= capacity)
+            return 0;
+        output[length++] = **p;
+        (*p)++;
+    }
+
+    output[length] = '\0';
+    return 1;
+}
+
+static uint32_t text_length(const char* text)
+{
+    uint32_t length = 0;
+    while (text[length] != '\0')
+        length++;
+    return length;
+}
+
+static int resolve_shell_path(
+    const char* path,
+    char* resolved,
+    uint32_t capacity)
+{
+    uint32_t length = 0;
+    const char* component;
+
+    if (path == 0 || resolved == 0 || capacity == 0)
+        return 0;
+
+    if (*path != '/')
+    {
+        while (current_directory[length])
+        {
+            if (length + 1 >= capacity)
+                return 0;
+            resolved[length] = current_directory[length];
+            length++;
+        }
+    }
+
+    component = path;
+    while (*component)
+    {
+        const char* end;
+        uint32_t component_length;
+
+        while (*component == '/')
+            component++;
+        if (*component == '\0')
+            break;
+
+        end = component;
+        while (*end && *end != '/')
+            end++;
+        component_length = (uint32_t)(end - component);
+
+        if (component_length == 1 && component[0] == '.')
+        {
+            component = end;
+            continue;
+        }
+
+        if (component_length == 2 &&
+            component[0] == '.' && component[1] == '.')
+        {
+            while (length > 0 && resolved[length - 1] != '/')
+                length--;
+            if (length > 0)
+                length--;
+            component = end;
+            continue;
+        }
+
+        if (component_length > FAT12_NAME_LENGTH ||
+            length + (length ? 1 : 0) + component_length >= capacity)
+            return 0;
+
+        if (length)
+            resolved[length++] = '/';
+        while (component < end)
+            resolved[length++] = *component++;
+    }
+
+    resolved[length] = '\0';
+    return 1;
+}
+
+static int path_is_current_ancestor(
+    const char* path,
+    const char* directory)
+{
+    uint32_t i = 0;
+
+    if (path[0] == '\0')
+        return directory[0] != '\0';
+
+    while (path[i] && path[i] == directory[i])
+        i++;
+
+    return path[i] == '\0' && directory[i] == '/';
+}
+
+static void print_shell_prompt(void)
+{
+    print("\nnnos:");
+    if (current_directory[0])
+    {
+        print("/");
+        print(current_directory);
+    }
+    print("> ");
+}
+
+static void command_change_directory(const char* args)
+{
+    char requested[INPUT_SIZE];
+    char resolved[INPUT_SIZE];
+    Fat12DirectoryEntry entry;
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    skip_spaces(&args);
+    if (!parse_token(&args, requested, sizeof(requested)))
+    {
+        if (*args != '\0')
+        {
+            print("\nUsage: cd [DIRECTORY]");
+            return;
+        }
+        print("\n");
+        print(current_directory[0] ? current_directory : "/");
+        return;
+    }
+
+    if (!no_more_arguments(args) ||
+        !resolve_shell_path(requested, resolved, sizeof(resolved)) ||
+        vfs_read_directory_entry(resolved, 0, &entry) < 0)
+    {
+        print("\nDirectory not found or invalid path.");
+        return;
+    }
+
+    {
+        uint32_t i = 0;
+        do
+        {
+            current_directory[i] = resolved[i];
+        } while (resolved[i++] != '\0');
+    }
+
+    print("\nCurrent directory: ");
+    print(current_directory[0] ? current_directory : "/");
 }
 
 void redraw_input(char* input, int length, int pos)
@@ -456,6 +626,7 @@ static void command_partcreate(const char* args)
         return;
     }
 
+    vfs_unmount();
     if (!mbr_write(selected_disk, &mbr))
     {
         print("\nDisk write failed.");
@@ -503,6 +674,7 @@ static void command_partdelete(const char* args)
         return;
     }
 
+    vfs_unmount();
     if (!mbr_write(selected_disk, &mbr))
     {
         print("\nDisk write failed.");
@@ -612,10 +784,389 @@ static void command_select_disk(const char* args)
     print(" MiB).");
 }
 
-static void command_disklabel(void)
+static void command_format_partition(const char* args)
 {
-    print("\nDisk label editing is not implemented yet.");
-    print("\nFirst we need a FAT12/FAT16 filesystem driver.");
+    uint32_t slot;
+    char filesystem[8] = "FAT12";
+    const char* confirmation = args;
+
+    if (!parse_number(&confirmation, &slot))
+    {
+        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        return;
+    }
+
+    skip_spaces(&confirmation);
+    if (confirmation[0] != 'C' &&
+        (!parse_token(&confirmation, filesystem, sizeof(filesystem)) ||
+         (!strings_equal(filesystem, "FAT12") &&
+          !strings_equal(filesystem, "FAT16") &&
+          !strings_equal(filesystem, "FAT32"))))
+    {
+        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        return;
+    }
+
+    if (!parse_confirmation(&confirmation) ||
+        !no_more_arguments(confirmation) ||
+        slot < 1 || slot > MBR_PARTITION_COUNT)
+    {
+        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        return;
+    }
+
+    print("\n!!! FORMAT WILL ERASE ALL DATA IN PARTITION ");
+    print_char('0' + (uint8_t)slot);
+    print(" !!!");
+    print("\nFormatting selected disk partition as ");
+    print(filesystem);
+    print("...");
+
+    current_directory[0] = '\0';
+    if (!vfs_format_partition_as(
+            selected_disk, (uint8_t)(slot - 1), filesystem))
+    {
+        print("\nFormat failed. Check MBR, partition size and disk I/O.");
+        return;
+    }
+
+    print("\nFilesystem formatted and mounted.");
+}
+
+static void command_format_disk(const char* args)
+{
+    uint32_t drive;
+    uint32_t partition;
+    char filesystem[8];
+    const char* confirmation = args;
+
+    if (!parse_number(&confirmation, &drive) ||
+        !parse_number(&confirmation, &partition) ||
+        !parse_token(&confirmation, filesystem, sizeof(filesystem)) ||
+        !parse_confirmation(&confirmation) ||
+        !no_more_arguments(confirmation) ||
+        drive >= 4 || partition < 1 ||
+        partition > MBR_PARTITION_COUNT ||
+        (!strings_equal(filesystem, "FAT12") &&
+         !strings_equal(filesystem, "FAT16") &&
+         !strings_equal(filesystem, "FAT32")))
+    {
+        print("\nUsage: formatdisk DRIVE PARTITION FAT12|FAT16|FAT32 CONFIRM");
+        return;
+    }
+
+    print("\nTarget disk: ");
+    print_char('0' + (uint8_t)drive);
+    print("\nTarget partition: ");
+    print_char('0' + (uint8_t)partition);
+    print("\nFilesystem: ");
+    print(filesystem);
+    print("\nFormatting permanently replaces filesystem metadata.");
+
+    selected_disk = (uint8_t)drive;
+    current_directory[0] = '\0';
+
+    if (!vfs_format_disk(
+            selected_disk, (uint8_t)(partition - 1), filesystem))
+    {
+        print("\nFormat failed. Check disk, partition and filesystem size limits.");
+        return;
+    }
+
+    print("\nPartition formatted and mounted.");
+}
+
+static void command_mount(const char* args)
+{
+    uint32_t slot;
+
+    if (!parse_number(&args, &slot) ||
+        !no_more_arguments(args) ||
+        slot < 1 || slot > MBR_PARTITION_COUNT)
+    {
+        print("\nUsage: mount PARTITION");
+        return;
+    }
+
+    current_directory[0] = '\0';
+    if (!vfs_mount_partition(selected_disk, (uint8_t)(slot - 1)))
+    {
+        print("\nMount failed. The selected partition is not a supported FAT volume.");
+        return;
+    }
+
+    print("\nFAT");
+    print_char((char)('0' + fat_mounted_type() / 10));
+    print_char((char)('0' + fat_mounted_type() % 10));
+    print(" partition mounted.");
+}
+
+static void command_ls(const char* args)
+{
+    uint16_t index;
+    int found = 0;
+    char path[INPUT_SIZE];
+    const char* directory = path;
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    skip_spaces(&args);
+    if (*args != '\0')
+    {
+        char requested[INPUT_SIZE];
+        if (!parse_token(&args, requested, sizeof(requested)) ||
+            !no_more_arguments(args) ||
+            !resolve_shell_path(requested, path, sizeof(path)))
+        {
+            print("\nUsage: ls [DIRECTORY]");
+            return;
+        }
+    }
+    else
+    {
+        uint32_t i = 0;
+        do
+        {
+            path[i] = current_directory[i];
+        } while (current_directory[i++] != '\0');
+    }
+
+    print("\nDirectory: ");
+    print(path[0] ? path : "/");
+    for (index = 0; index < 1024; index++)
+    {
+        Fat12DirectoryEntry entry;
+        int result = vfs_read_directory_entry(directory, index, &entry);
+
+        if (result < 0)
+        {
+            print("\nDirectory read failed.");
+            return;
+        }
+        if (result == 0)
+            break;
+        if (result != 1)
+            continue;
+
+        found = 1;
+        print("\n");
+        print(entry.name);
+        if (entry.attributes & 0x10)
+            print("  <DIR>");
+        else
+        {
+            print("  ");
+            print_dec32(entry.size);
+            print(" bytes");
+        }
+    }
+
+    if (!found)
+        print("\n(empty)");
+}
+
+static void command_cat(const char* args)
+{
+    static uint8_t buffer[4096];
+    char name[INPUT_SIZE];
+    char path[INPUT_SIZE];
+    uint32_t size;
+    uint32_t i;
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, name, sizeof(name)) ||
+        !no_more_arguments(args) ||
+        !resolve_shell_path(name, path, sizeof(path)))
+    {
+        print("\nUsage: cat [DIR/]NAME.EXT");
+        return;
+    }
+
+    if (!vfs_read_file(path, buffer, sizeof(buffer), &size))
+    {
+        print("\nFile not found, invalid, or larger than 4096 bytes.");
+        return;
+    }
+
+    print("\n");
+    for (i = 0; i < size; i++)
+        print_char((char)buffer[i]);
+}
+
+static void command_write_file(const char* args)
+{
+    char name[INPUT_SIZE];
+    char path[INPUT_SIZE];
+    uint32_t size;
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, name, sizeof(name)))
+    {
+        print("\nUsage: write NAME.EXT TEXT");
+        return;
+    }
+
+    if (!resolve_shell_path(name, path, sizeof(path)))
+    {
+        print("\nInvalid file path.");
+        return;
+    }
+
+    skip_spaces(&args);
+    if (*args == '\0')
+    {
+        print("\nUsage: write NAME.EXT TEXT");
+        return;
+    }
+
+    size = text_length(args);
+    if (!vfs_create_file(path, (const uint8_t*)args, size))
+    {
+        print("\nFile creation failed (check 8.3 name, space, or duplicate name).");
+        return;
+    }
+
+    print("\nFile created.");
+}
+
+static void command_edit_file(const char* args)
+{
+    char name[INPUT_SIZE];
+    char path[INPUT_SIZE];
+    uint32_t size;
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, name, sizeof(name)))
+    {
+        print("\nUsage: edit [DIR/]NAME.EXT TEXT");
+        return;
+    }
+
+    if (!resolve_shell_path(name, path, sizeof(path)))
+    {
+        print("\nInvalid file path.");
+        return;
+    }
+
+    skip_spaces(&args);
+    size = text_length(args);
+    if (!vfs_write_file(path, (const uint8_t*)args, size))
+    {
+        print("\nEdit failed (check path, 8.3 name, and free space).");
+        return;
+    }
+
+    print("\nFile saved.");
+}
+
+static void command_remove_file(const char* args)
+{
+    char name[INPUT_SIZE];
+    char path[INPUT_SIZE];
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, name, sizeof(name)) ||
+        !no_more_arguments(args) ||
+        !resolve_shell_path(name, path, sizeof(path)))
+    {
+        print("\nUsage: rm NAME.EXT");
+        return;
+    }
+
+    if (!vfs_delete_file(path))
+    {
+        print("\nFile deletion failed.");
+        return;
+    }
+
+    print("\nFile deleted.");
+}
+
+static void command_make_directory(const char* args)
+{
+    char path[INPUT_SIZE];
+    char resolved[INPUT_SIZE];
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, path, sizeof(path)) ||
+        !no_more_arguments(args) ||
+        !resolve_shell_path(path, resolved, sizeof(resolved)))
+    {
+        print("\nUsage: mkdir [PARENT/]NAME");
+        return;
+    }
+
+    if (!vfs_create_directory(resolved))
+    {
+        print("\nDirectory creation failed (check path, name, and free space).");
+        return;
+    }
+
+    print("\nDirectory created.");
+}
+
+static void command_remove_directory(const char* args)
+{
+    char path[INPUT_SIZE];
+    char resolved[INPUT_SIZE];
+
+    if (!vfs_is_mounted())
+    {
+        print("\nNo FAT filesystem is mounted.");
+        return;
+    }
+
+    if (!parse_token(&args, path, sizeof(path)) ||
+        !no_more_arguments(args) ||
+        !resolve_shell_path(path, resolved, sizeof(resolved)))
+    {
+        print("\nUsage: rmdir [PARENT/]NAME");
+        return;
+    }
+
+    if (strings_equal(resolved, current_directory) ||
+        path_is_current_ancestor(resolved, current_directory))
+    {
+        print("\nCannot remove the current directory or one of its parents.");
+        return;
+    }
+
+    if (!vfs_delete_directory(resolved))
+    {
+        print("\nDirectory removal failed; it may not be empty.");
+        return;
+    }
+
+    print("\nDirectory removed.");
 }
 
 static void command_diskzero(const char* args)
@@ -653,6 +1204,7 @@ static void command_diskzero(const char* args)
         return;
     }
 
+    vfs_unmount();
     print("\n!!! PERMANENT DATA DESTRUCTION !!!");
     print("\nThis will write zeros to every sector on disk ");
     print_char('0' + selected_disk);
@@ -699,26 +1251,21 @@ static void command_diskzero(const char* args)
 static void command_help(void)
 {
     print("\nCommands:");
-    print("\nhelp");
-    print("\ncls");
-    print("\nclear");
-    print("\nver");
-    print("\necho TEXT");
-    print("\nshutdown");
-    print("\nclhis");
-    print("\nmbr");
-    print("\ndisks");
-    print("\ndisk DRIVE");
-    print("\nmbrinit CONFIRM (zero-filled sector 0 only)");
-    print("\nmbrwritetest CONFIRM");
-    print("\npartlist");
+    print("\nhelp / cls / clear / ver / echo TEXT");
+    print("\nshutdown / clhis");
+    print("\ndisks / disk DRIVE / mbr / partlist");
+    print("\nmbrinit CONFIRM / mbrwritetest CONFIRM");
     print("\npartcreate SLOT TYPE START_MB SIZE_MB CONFIRM");
-    print("\npartdelete SLOT CONFIRM");
-    print("\npartactive SLOT CONFIRM");
-    print("\nSizes and start positions use MiB (1 MiB = 2048 sectors).");
-    print("\nChanges require CONFIRM; partition contents are not formatted.");
-    print("\ndisklabel");
-    print("\ndiskzero DRIVE CONFIRM (IRREVERSIBLE; ERASES ALL DATA)");
+    print("\npartdelete SLOT CONFIRM / partactive SLOT CONFIRM");
+    print("\nformat PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+    print("\nformatdisk DRIVE PARTITION FAT12|FAT16|FAT32 CONFIRM");
+    print("\nmount PARTITION / umount");
+    print("\ncd [DIR] / ls [DIR] / dir [DIR]");
+    print("\nmkdir DIR / rmdir DIR");
+    print("\ncat FILE / write FILE TEXT / edit FILE TEXT / rm FILE");
+    print("\nFAT12/16/32 volumes; filenames use FAT 8.3 format.");
+    print("\nDisk changes require CONFIRM.");
+    print("\ndiskzero DRIVE CONFIRM erases the entire disk.");
 }
 
 static void execute_command(char* input, int length)
@@ -796,9 +1343,67 @@ static void execute_command(char* input, int length)
     {
         command_partactive(input + 10);
     }
-    else if (strings_equal(input, "disklabel"))
+    else if (starts_command(input, "formatdisk"))
     {
-        command_disklabel();
+        command_format_disk(input + 10);
+    }
+    else if (starts_command(input, "format"))
+    {
+        command_format_partition(input + 6);
+    }
+    else if (starts_command(input, "mount"))
+    {
+        command_mount(input + 5);
+    }
+    else if (strings_equal(input, "umount"))
+    {
+        vfs_unmount();
+        current_directory[0] = '\0';
+        print("\nFilesystem unmounted.");
+    }
+    else if (starts_command(input, "cd"))
+    {
+        command_change_directory(input + 2);
+    }
+    else if (strings_equal(input, "ls"))
+    {
+        command_ls("");
+    }
+    else if (starts_command(input, "ls"))
+    {
+        command_ls(input + 2);
+    }
+    else if (strings_equal(input, "dir"))
+    {
+        command_ls("");
+    }
+    else if (starts_command(input, "dir"))
+    {
+        command_ls(input + 3);
+    }
+    else if (starts_command(input, "cat"))
+    {
+        command_cat(input + 3);
+    }
+    else if (starts_command(input, "write"))
+    {
+        command_write_file(input + 5);
+    }
+    else if (starts_command(input, "edit"))
+    {
+        command_edit_file(input + 4);
+    }
+    else if (starts_command(input, "mkdir"))
+    {
+        command_make_directory(input + 5);
+    }
+    else if (starts_command(input, "rmdir"))
+    {
+        command_remove_directory(input + 5);
+    }
+    else if (starts_command(input, "rm"))
+    {
+        command_remove_file(input + 2);
     }
     else if (starts_command(input, "diskzero"))
     {
@@ -825,7 +1430,8 @@ void init_c(void)
     cls();
 
     print("nnos Kernel v0.0.2\n");
-    print("nnos> ");
+    current_directory[0] = '\0';
+    print("nnos:/> ");
 
     input_start_x = cursor_x;
     input_start_y = cursor_y;
@@ -924,7 +1530,7 @@ void init_c(void)
             rendered_length = 0;
             input[0] = '\0';
 
-            print("\nnnos> ");
+            print_shell_prompt();
 
             input_start_x = cursor_x;
             input_start_y = cursor_y;
