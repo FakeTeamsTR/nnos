@@ -14,7 +14,7 @@ static int partition_type_is_unsupported(uint8_t type)
 
 int mbr_read(uint8_t drive, MBR *mbr)
 {
-    if (drive >= 4 || mbr == 0)
+    if (drive >= DISK_MAX_DEVICES || mbr == 0)
         return 0;
 
     if (!disk_read_sector_on_drive(drive, 0, (uint8_t *)mbr))
@@ -23,7 +23,7 @@ int mbr_read(uint8_t drive, MBR *mbr)
     return mbr->signature == MBR_SIGNATURE;
 }
 
-int mbr_validate(const MBR *mbr, uint32_t disk_sector_count)
+int mbr_validate(const MBR *mbr, uint64_t disk_sector_count)
 {
     uint8_t i;
     uint8_t active_count = 0;
@@ -36,6 +36,7 @@ int mbr_validate(const MBR *mbr, uint32_t disk_sector_count)
     {
         const PartitionEntry *p = &mbr->partitions[i];
         uint8_t j;
+        uint64_t end;
 
         if (p->type == 0)
         {
@@ -47,23 +48,24 @@ int mbr_validate(const MBR *mbr, uint32_t disk_sector_count)
 
         if ((p->status != 0x00 && p->status != 0x80) ||
             p->lba_start == 0 || p->sector_count == 0 ||
+            (uint64_t)p->lba_start + p->sector_count > 0x100000000ull ||
             p->lba_start >= disk_sector_count ||
             p->sector_count > disk_sector_count - p->lba_start)
             return 0;
 
+        end = (uint64_t)p->lba_start + p->sector_count;
         if (p->status == 0x80 && ++active_count > 1)
             return 0;
 
         for (j = 0; j < i; j++)
         {
             const PartitionEntry *other = &mbr->partitions[j];
-            uint32_t end = p->lba_start + p->sector_count;
-            uint32_t other_end;
+            uint64_t other_end;
 
             if (other->type == 0)
                 continue;
 
-            other_end = other->lba_start + other->sector_count;
+            other_end = (uint64_t)other->lba_start + other->sector_count;
             if (p->lba_start < other_end &&
                 other->lba_start < end)
                 return 0;
@@ -79,7 +81,7 @@ int mbr_initialize(uint8_t drive)
     uint8_t *bytes = (uint8_t *)&mbr;
     uint16_t i;
 
-    if (drive >= 4 ||
+    if (drive >= DISK_MAX_DEVICES ||
         !disk_read_sector_on_drive(drive, 0, bytes))
         return 0;
 
@@ -96,10 +98,10 @@ int mbr_initialize(uint8_t drive)
 int mbr_write(uint8_t drive, const MBR *mbr)
 {
     MBR current;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
     uint8_t i;
 
-    if (drive >= 4 || mbr == 0 ||
+    if (drive >= DISK_MAX_DEVICES || mbr == 0 ||
         mbr->signature != MBR_SIGNATURE ||
         !disk_get_sector_count(drive, &disk_sector_count) ||
         !mbr_validate(mbr, disk_sector_count) ||
@@ -138,9 +140,10 @@ int mbr_create_partition(
     uint32_t sector_count)
 {
     PartitionEntry *p;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
 
-    if (mbr == 0 || drive >= 4 || slot >= MBR_PARTITION_COUNT ||
+    if (mbr == 0 || drive >= DISK_MAX_DEVICES ||
+        slot >= MBR_PARTITION_COUNT ||
         type == 0 || partition_type_is_unsupported(type) ||
         start_lba == 0 || sector_count == 0 ||
         !disk_get_sector_count(drive, &disk_sector_count) ||
@@ -201,7 +204,7 @@ int mbr_delete_partition(MBR *mbr, uint8_t slot)
 int mbr_set_active(
     MBR *mbr,
     uint8_t slot,
-    uint32_t disk_sector_count)
+    uint64_t disk_sector_count)
 {
     uint8_t i;
 

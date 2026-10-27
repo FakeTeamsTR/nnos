@@ -4,6 +4,7 @@
 #include "disk.h"
 #include "mbr.h"
 #include "vfs.h"
+#include "fat12.h"
 
 extern void print(const char* str);
 extern char input_api(void);
@@ -17,6 +18,7 @@ extern void set_cursor_position(int x, int y);
 extern void print_hex8(uint8_t value);
 extern void print_hex32(uint32_t value);
 extern void print_dec32(uint32_t value);
+extern void print_dec64(uint64_t value);
 
 extern int cursor_x;
 extern int cursor_y;
@@ -37,6 +39,8 @@ int input_start_y = 0;
 
 static uint8_t selected_disk = 0;
 static char current_directory[INPUT_SIZE];
+
+void redraw_input(char* input, int length, int pos);
 
 int strcmp(const char* a, const char* b)
 {
@@ -107,6 +111,88 @@ static int no_more_arguments(const char* p)
 {
     skip_spaces(&p);
     return *p == '\0';
+}
+
+static int prompt_line(const char* prompt, char* output, uint32_t capacity)
+{
+    int length = 0;
+    int position = 0;
+
+    if (output == 0 || capacity < 2)
+        return 0;
+    print(prompt);
+    input_start_x = cursor_x;
+    input_start_y = cursor_y;
+    rendered_length = 0;
+    output[0] = '\0';
+
+    while (1)
+    {
+        char key = input_api();
+
+        if (key == '\n')
+        {
+            redraw_input(output, length, length);
+            print_char(' ');
+            print("\n");
+            return 1;
+        }
+        if (key == KEY_LEFT)
+        {
+            if (position > 0)
+                position--;
+        }
+        else if (key == KEY_RIGHT)
+        {
+            if (position < length)
+                position++;
+        }
+        else if (key == '\b')
+        {
+            if (position > 0)
+            {
+                for (int i = position - 1; i < length - 1; i++)
+                    output[i] = output[i + 1];
+                length--;
+                position--;
+                output[length] = '\0';
+            }
+        }
+        else if (key >= 32 && key <= 126 &&
+                 (uint32_t)length + 1 < capacity)
+        {
+            for (int i = length; i > position; i--)
+                output[i] = output[i - 1];
+            output[position++] = key;
+            length++;
+            output[length] = '\0';
+        }
+        else
+        {
+            continue;
+        }
+
+        redraw_input(output, length, position);
+    }
+}
+
+static int prompt_number(
+    const char* prompt, uint32_t* value, int allow_empty)
+{
+    char text[32];
+    const char* parsed;
+
+    if (!prompt_line(prompt, text, sizeof(text)))
+        return 0;
+    parsed = text;
+    if (allow_empty && *parsed == '\0')
+        return 2;
+    if (!parse_number(&parsed, value) || !no_more_arguments(parsed))
+    {
+        print("Enter a non-negative whole number.");
+        return 0;
+    }
+    return 1;
 }
 
 static int parse_confirmation(const char** p)
@@ -296,7 +382,8 @@ static void command_change_directory(const char* args)
 
 void redraw_input(char* input, int length, int pos)
 {
-    unsigned char* video = (unsigned char*)0xB8000;
+    volatile unsigned char* video =
+        (volatile unsigned char*)0xB8000;
     int i;
     int max_length = length;
 
@@ -395,7 +482,7 @@ static void history_add(const char* input, int length)
 static void command_mbr(void)
 {
     MBR mbr;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
     int i;
 
     print("\nReading selected disk MBR...");
@@ -505,7 +592,7 @@ static void command_mbr_initialize(const char* args)
     }
 
     print("\nThis initializes sector 0 on selected disk ");
-    print_char('0' + selected_disk);
+    print_dec32(selected_disk);
     print(" only if the entire sector is zero.");
 
     if (!mbr_initialize(selected_disk))
@@ -520,7 +607,7 @@ static void command_mbr_initialize(const char* args)
 static void command_partlist(void)
 {
     MBR mbr;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
     int i;
     int found = 0;
 
@@ -576,38 +663,81 @@ static void command_partlist(void)
 
 static void command_partcreate(const char* args)
 {
+    uint32_t values[5];
+    uint32_t argument_count = 0;
+    uint32_t value;
+    uint32_t drive;
     uint32_t slot;
     uint32_t type;
     uint32_t start_mb;
     uint32_t size_mb;
+    uint64_t disk_sector_count;
+    uint8_t target_drive;
     MBR mbr;
     const char* confirmation = args;
 
-    if (!parse_number(&confirmation, &slot) ||
-        !parse_number(&confirmation, &type) ||
-        !parse_number(&confirmation, &start_mb) ||
-        !parse_number(&confirmation, &size_mb) ||
+    while (argument_count < 5 &&
+           parse_number(&confirmation, &value))
+    {
+        values[argument_count++] = value;
+    }
+
+    if ((argument_count != 4 && argument_count != 5) ||
         !parse_confirmation(&confirmation) ||
         !no_more_arguments(confirmation))
     {
         print("\nUsage: partcreate SLOT TYPE START_MB SIZE_MB CONFIRM");
+        print("\n   or: partcreate DRIVE SLOT TYPE START_MB SIZE_MB CONFIRM");
         print("\nExample: partcreate 1 12 1 512 CONFIRM");
         return;
     }
 
-    if (slot < 1 || slot > 4 || type < 1 || type > 255 ||
+    if (argument_count == 5)
+    {
+        drive = values[0];
+        slot = values[1];
+        type = values[2];
+        start_mb = values[3];
+        size_mb = values[4];
+    }
+    else
+    {
+        drive = selected_disk;
+        slot = values[0];
+        type = values[1];
+        start_mb = values[2];
+        size_mb = values[3];
+    }
+
+    if (drive >= DISK_MAX_DEVICES ||
+        slot < 1 || slot > MBR_PARTITION_COUNT ||
+        type < 1 || type > 255 ||
         start_mb == 0 || size_mb == 0 ||
         start_mb > 0xFFFFFFFFu / 2048 ||
         size_mb > 0xFFFFFFFFu / 2048)
     {
         print("\nInvalid argument.");
+        print("\nDRIVE must be below ");
+        print_dec32(DISK_MAX_DEVICES);
+        print(" and SLOT must be 1-4.");
         return;
     }
 
-    print("\nWARNING: this changes the selected disk's partition table.");
+    target_drive = (uint8_t)drive;
+    if (!disk_get_sector_count(target_drive, &disk_sector_count))
+    {
+        print("\nTarget disk is unavailable or unsupported.");
+        return;
+    }
+
+    print("\nWARNING: this changes disk ");
+    print_dec32(drive);
+    print("'s partition table, slot ");
+    print_dec32(slot);
+    print(".");
     print("\nIt does not format or erase partition contents.");
 
-    if (!mbr_read(selected_disk, &mbr))
+    if (!mbr_read(target_drive, &mbr))
     {
         print("\nCannot read a valid MBR.");
         return;
@@ -615,7 +745,7 @@ static void command_partcreate(const char* args)
 
     if (!mbr_create_partition(
             &mbr,
-            selected_disk,
+            target_drive,
             (uint8_t)(slot - 1),
             (uint8_t)type,
             start_mb * 2048,
@@ -626,11 +756,21 @@ static void command_partcreate(const char* args)
         return;
     }
 
-    vfs_unmount();
-    if (!mbr_write(selected_disk, &mbr))
+    if (!mbr_write(target_drive, &mbr))
     {
+        if (target_drive == selected_disk)
+        {
+            vfs_unmount();
+            current_directory[0] = '\0';
+        }
         print("\nDisk write failed.");
         return;
+    }
+
+    if (target_drive == selected_disk)
+    {
+        vfs_unmount();
+        current_directory[0] = '\0';
     }
 
     print("\nPartition entry written.");
@@ -638,25 +778,52 @@ static void command_partcreate(const char* args)
 
 static void command_partdelete(const char* args)
 {
+    uint32_t values[2];
+    uint32_t argument_count = 0;
+    uint32_t value;
+    uint32_t drive;
     uint32_t slot;
+    uint8_t target_drive;
     MBR mbr;
     const char* confirmation = args;
 
-    if (!parse_number(&confirmation, &slot) ||
+    while (argument_count < 2 &&
+           parse_number(&confirmation, &value))
+    {
+        values[argument_count++] = value;
+    }
+
+    if ((argument_count != 1 && argument_count != 2) ||
         !parse_confirmation(&confirmation) ||
-        !no_more_arguments(confirmation) ||
-        slot < 1 || slot > 4)
+        !no_more_arguments(confirmation))
     {
         print("\nUsage: partdelete SLOT CONFIRM");
+        print("\n   or: partdelete DRIVE SLOT CONFIRM");
         print("\nExample: partdelete 1 CONFIRM");
         return;
     }
 
-    print("\nThis removes the selected partition entry only.");
+    drive = argument_count == 2 ? values[0] : selected_disk;
+    slot = argument_count == 2 ? values[1] : values[0];
+    if (drive >= DISK_MAX_DEVICES ||
+        slot < 1 || slot > MBR_PARTITION_COUNT)
+    {
+        print("\nInvalid argument. DRIVE must be below ");
+        print_dec32(DISK_MAX_DEVICES);
+        print(" and SLOT must be 1-4.");
+        return;
+    }
+
+    target_drive = (uint8_t)drive;
+    print("\nTarget disk: ");
+    print_dec32(drive);
+    print("\nTarget partition slot: ");
+    print_dec32(slot);
+    print("\nThis removes that partition entry only.");
     print("\nPartition contents are not erased.");
     print("\nRemoving an entry can make existing data inaccessible.");
 
-    if (!mbr_read(selected_disk, &mbr))
+    if (!mbr_read(target_drive, &mbr))
     {
         print("\nCannot read a valid MBR.");
         return;
@@ -674,11 +841,21 @@ static void command_partdelete(const char* args)
         return;
     }
 
-    vfs_unmount();
-    if (!mbr_write(selected_disk, &mbr))
+    if (!mbr_write(target_drive, &mbr))
     {
+        if (target_drive == selected_disk)
+        {
+            vfs_unmount();
+            current_directory[0] = '\0';
+        }
         print("\nDisk write failed.");
         return;
+    }
+
+    if (target_drive == selected_disk)
+    {
+        vfs_unmount();
+        current_directory[0] = '\0';
     }
 
     print("\nPartition entry deleted.");
@@ -686,24 +863,51 @@ static void command_partdelete(const char* args)
 
 static void command_partactive(const char* args)
 {
+    uint32_t values[2];
+    uint32_t argument_count = 0;
+    uint32_t value;
+    uint32_t drive;
     uint32_t slot;
-    uint32_t disk_sector_count;
+    uint8_t target_drive;
+    uint64_t disk_sector_count;
     MBR mbr;
     const char* confirmation = args;
 
-    if (!parse_number(&confirmation, &slot) ||
+    while (argument_count < 2 &&
+           parse_number(&confirmation, &value))
+    {
+        values[argument_count++] = value;
+    }
+
+    if ((argument_count != 1 && argument_count != 2) ||
         !parse_confirmation(&confirmation) ||
-        !no_more_arguments(confirmation) ||
-        slot < 1 || slot > MBR_PARTITION_COUNT)
+        !no_more_arguments(confirmation))
     {
         print("\nUsage: partactive SLOT CONFIRM");
+        print("\n   or: partactive DRIVE SLOT CONFIRM");
         return;
     }
 
-    if (!mbr_read(selected_disk, &mbr) ||
-        !disk_get_sector_count(selected_disk, &disk_sector_count))
+    drive = argument_count == 2 ? values[0] : selected_disk;
+    slot = argument_count == 2 ? values[1] : values[0];
+    if (drive >= DISK_MAX_DEVICES ||
+        slot < 1 || slot > MBR_PARTITION_COUNT)
     {
-        print("\nCannot read selected disk MBR.");
+        print("\nInvalid argument. DRIVE must be below ");
+        print_dec32(DISK_MAX_DEVICES);
+        print(" and SLOT must be 1-4.");
+        return;
+    }
+
+    target_drive = (uint8_t)drive;
+    print("\nTarget disk: ");
+    print_dec32(drive);
+    print("\nTarget partition slot: ");
+    print_dec32(slot);
+    if (!mbr_read(target_drive, &mbr) ||
+        !disk_get_sector_count(target_drive, &disk_sector_count))
+    {
+        print("\nCannot read target disk MBR.");
         return;
     }
 
@@ -713,7 +917,7 @@ static void command_partactive(const char* args)
         return;
     }
 
-    if (!mbr_write(selected_disk, &mbr))
+    if (!mbr_write(target_drive, &mbr))
     {
         print("\nDisk write failed.");
         return;
@@ -731,56 +935,95 @@ static void command_disks(void)
         "secondary slave"
     };
     uint8_t drive;
+    uint8_t found = 0;
 
-    print("\nATA drives (LBA28):");
-
-    for (drive = 0; drive < 4; drive++)
+    for (drive = 0; drive < DISK_MAX_DEVICES; drive++)
     {
-        uint32_t sectors;
-
-        print("\n");
-        print_char('0' + drive);
-        print(": ");
-        print(names[drive]);
+        uint64_t sectors;
 
         if (!disk_get_sector_count(drive, &sectors))
-        {
-            print(" - unavailable");
             continue;
+
+        if (!found)
+        {
+            print("\nAvailable disks (ATA PIO / AHCI / USB):");
+            found = 1;
+        }
+
+        print("\n");
+        print_dec32(drive);
+        print(": ");
+        if (drive < 4)
+            print(names[drive]);
+        else if (drive < USB_DRIVE_BASE)
+        {
+            print("AHCI SATA port ");
+            print_dec32(drive - AHCI_DRIVE_BASE);
+        }
+        else if (drive < OHCI_DRIVE_BASE)
+        {
+            print("USB UHCI mass storage ");
+            print_dec32(drive - USB_DRIVE_BASE);
+        }
+        else if (drive < EHCI_DRIVE_BASE)
+        {
+            print("USB OHCI controller/port slot ");
+            print_dec32(drive - OHCI_DRIVE_BASE);
+        }
+        else if (drive < XHCI_DRIVE_BASE)
+        {
+            print("USB EHCI controller/port slot ");
+            print_dec32(drive - EHCI_DRIVE_BASE);
+        }
+        else
+        {
+            print("USB xHCI controller/port slot ");
+            print_dec32(drive - XHCI_DRIVE_BASE);
         }
 
         print(" - ");
-        print_dec32(sectors / 2048);
+        print_dec64(sectors >> 11);
         print(" MiB");
 
         if (drive == selected_disk)
             print(" (selected)");
     }
+
+    if (!found)
+        print("\nNo available disks detected.");
 }
 
 static void command_select_disk(const char* args)
 {
     uint32_t drive;
-    uint32_t sectors;
+    uint64_t sectors;
 
     if (!parse_number(&args, &drive) ||
-        !no_more_arguments(args) || drive >= 4)
+        !no_more_arguments(args) || drive >= DISK_MAX_DEVICES)
     {
-        print("\nUsage: disk DRIVE (0-3)");
+        print("\nUsage: disk DRIVE (0-");
+        print_dec32(DISK_MAX_DEVICES - 1);
+        print(")");
         return;
     }
 
     if (!disk_get_sector_count((uint8_t)drive, &sectors))
     {
-        print("\nSelected ATA drive is unavailable or unsupported.");
+        print("\nSelected disk is unavailable or unsupported.");
         return;
+    }
+
+    if (selected_disk != (uint8_t)drive)
+    {
+        vfs_unmount();
+        current_directory[0] = '\0';
     }
 
     selected_disk = (uint8_t)drive;
     print("\nSelected disk ");
-    print_char('0' + selected_disk);
+    print_dec32(selected_disk);
     print(" (");
-    print_dec32(sectors / 2048);
+    print_dec64(sectors >> 11);
     print(" MiB).");
 }
 
@@ -792,7 +1035,7 @@ static void command_format_partition(const char* args)
 
     if (!parse_number(&confirmation, &slot))
     {
-        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        print("\nUsage: format PARTITION(1-4) [FAT12|FAT16|FAT32] CONFIRM");
         return;
     }
 
@@ -803,7 +1046,7 @@ static void command_format_partition(const char* args)
           !strings_equal(filesystem, "FAT16") &&
           !strings_equal(filesystem, "FAT32"))))
     {
-        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        print("\nUsage: format PARTITION(1-4) [FAT12|FAT16|FAT32] CONFIRM");
         return;
     }
 
@@ -811,25 +1054,33 @@ static void command_format_partition(const char* args)
         !no_more_arguments(confirmation) ||
         slot < 1 || slot > MBR_PARTITION_COUNT)
     {
-        print("\nUsage: format PARTITION [FAT12|FAT16|FAT32] CONFIRM");
+        print("\nUsage: format PARTITION(1-4) [FAT12|FAT16|FAT32] CONFIRM");
         return;
     }
 
     print("\n!!! FORMAT WILL ERASE ALL DATA IN PARTITION ");
-    print_char('0' + (uint8_t)slot);
+    print_dec32(slot);
+    print(" ON DISK ");
+    print_dec32(selected_disk);
     print(" !!!");
-    print("\nFormatting selected disk partition as ");
+    print("\nFormatting partition ");
+    print_dec32(slot);
+    print(" on selected disk ");
+    print_dec32(selected_disk);
+    print(" as ");
     print(filesystem);
     print("...");
 
-    current_directory[0] = '\0';
     if (!vfs_format_partition_as(
             selected_disk, (uint8_t)(slot - 1), filesystem))
     {
+        if (!vfs_is_mounted())
+            current_directory[0] = '\0';
         print("\nFormat failed. Check MBR, partition size and disk I/O.");
         return;
     }
 
+    current_directory[0] = '\0';
     print("\nFilesystem formatted and mounted.");
 }
 
@@ -837,6 +1088,7 @@ static void command_format_disk(const char* args)
 {
     uint32_t drive;
     uint32_t partition;
+    uint64_t disk_sectors;
     char filesystem[8];
     const char* confirmation = args;
 
@@ -845,35 +1097,243 @@ static void command_format_disk(const char* args)
         !parse_token(&confirmation, filesystem, sizeof(filesystem)) ||
         !parse_confirmation(&confirmation) ||
         !no_more_arguments(confirmation) ||
-        drive >= 4 || partition < 1 ||
+        drive >= DISK_MAX_DEVICES || partition < 1 ||
         partition > MBR_PARTITION_COUNT ||
         (!strings_equal(filesystem, "FAT12") &&
          !strings_equal(filesystem, "FAT16") &&
          !strings_equal(filesystem, "FAT32")))
     {
-        print("\nUsage: formatdisk DRIVE PARTITION FAT12|FAT16|FAT32 CONFIRM");
+        print("\nUsage: formatdisk DRIVE PARTITION(1-4) FAT12|FAT16|FAT32 CONFIRM");
+        return;
+    }
+
+    if (!disk_get_sector_count((uint8_t)drive, &disk_sectors))
+    {
+        print("\nDisk ");
+        print_dec32(drive);
+        print(" is unavailable; selection and current mount were not changed.");
         return;
     }
 
     print("\nTarget disk: ");
-    print_char('0' + (uint8_t)drive);
+    print_dec32(drive);
+    print(" (");
+    print_dec64(disk_sectors >> 11);
+    print(" MiB)");
     print("\nTarget partition: ");
-    print_char('0' + (uint8_t)partition);
+    print_dec32(partition);
     print("\nFilesystem: ");
     print(filesystem);
     print("\nFormatting permanently replaces filesystem metadata.");
 
-    selected_disk = (uint8_t)drive;
-    current_directory[0] = '\0';
-
     if (!vfs_format_disk(
-            selected_disk, (uint8_t)(partition - 1), filesystem))
+            (uint8_t)drive, (uint8_t)(partition - 1), filesystem))
     {
+        if (!vfs_is_mounted())
+            current_directory[0] = '\0';
         print("\nFormat failed. Check disk, partition and filesystem size limits.");
         return;
     }
 
+    selected_disk = (uint8_t)drive;
+    current_directory[0] = '\0';
     print("\nPartition formatted and mounted.");
+}
+
+static int find_partition_gap(
+    const MBR* mbr,
+    uint64_t disk_sectors,
+    uint32_t required_sectors,
+    uint32_t* start_lba)
+{
+    uint64_t candidate = 2048;
+
+    for (uint8_t attempt = 0; attempt <= MBR_PARTITION_COUNT; attempt++)
+    {
+        uint64_t containing_end = 0;
+        uint64_t next_start = 0xFFFFFFFFFFFFFFFFull;
+        uint64_t next_end = 0;
+
+        for (uint8_t i = 0; i < MBR_PARTITION_COUNT; i++)
+        {
+            const PartitionEntry* partition = &mbr->partitions[i];
+            uint64_t start;
+            uint64_t end;
+
+            if (partition->type == 0)
+                continue;
+            start = partition->lba_start;
+            end = start + partition->sector_count;
+            if (start <= candidate && candidate < end && end > containing_end)
+                containing_end = end;
+            else if (start > candidate && start < next_start)
+            {
+                next_start = start;
+                next_end = end;
+            }
+        }
+
+        if (containing_end != 0)
+        {
+            candidate = (containing_end + 2047u) & ~2047ull;
+            continue;
+        }
+        if (candidate + required_sectors <= next_start &&
+            candidate + required_sectors <= disk_sectors &&
+            candidate + required_sectors <= 0x100000000ull)
+        {
+            *start_lba = (uint32_t)candidate;
+            return 1;
+        }
+        if (next_start == 0xFFFFFFFFFFFFFFFFull)
+            return 0;
+        candidate = (next_end + 2047u) & ~2047ull;
+    }
+    return 0;
+}
+
+static void command_format_wizard(void)
+{
+    char text[32];
+    char filesystem[8];
+    const char* parsed;
+    uint32_t drive_input;
+    uint32_t size_mib;
+    uint32_t start_lba;
+    uint32_t partition_slot = MBR_PARTITION_COUNT;
+    uint8_t drive;
+    uint8_t partition_type;
+    uint64_t disk_sectors;
+    MBR mbr;
+    int prompt_result;
+
+    print("\nGuided disk setup");
+    print("\nThis creates a new partition in free space, then formats it.");
+    print("\nExisting partitions and data are not resized or overwritten.");
+
+    prompt_result = prompt_number("\nDisk ID [selected disk]: ",
+        &drive_input, 1);
+    if (prompt_result == 0)
+        return;
+    drive = prompt_result == 2 ? selected_disk : (uint8_t)drive_input;
+    if (prompt_result != 2 && drive_input >= DISK_MAX_DEVICES)
+    {
+        print("Disk ID is out of range.");
+        return;
+    }
+    if (!disk_get_sector_count(drive, &disk_sectors))
+    {
+        print("\nDisk is unavailable or unsupported.");
+        return;
+    }
+    if (!mbr_read(drive, &mbr) || !mbr_validate(&mbr, disk_sectors))
+    {
+        print("\nNo valid MBR found.");
+        print("\nUse mbrinit CONFIRM only if the entire disk is blank.");
+        return;
+    }
+
+    for (uint32_t i = 0; i < MBR_PARTITION_COUNT; i++)
+        if (mbr.partitions[i].type == 0)
+        {
+            partition_slot = i;
+            break;
+        }
+    if (partition_slot == MBR_PARTITION_COUNT)
+    {
+        print("\nAll four MBR partition slots are in use.");
+        return;
+    }
+
+    print("\nDisk capacity: ");
+    print_dec64(disk_sectors >> 11);
+    print(" MiB.");
+    print("\nThe first free partition slot is ");
+    print_dec32(partition_slot + 1);
+    print(".");
+    prompt_result = prompt_number("\nNew partition size in MiB: ",
+        &size_mib, 0);
+    if (prompt_result == 0)
+        return;
+    if (size_mib == 0 || size_mib > 0xFFFFFFFFu / 2048u ||
+        !find_partition_gap(&mbr, disk_sectors, size_mib * 2048u,
+                            &start_lba))
+    {
+        print("\nThat size does not fit in the available MBR partition space.");
+        return;
+    }
+
+    if (!prompt_line("\nFilesystem [FAT12/FAT16/FAT32]: ",
+                     filesystem, sizeof(filesystem)))
+        return;
+    if (filesystem[0] == '\0')
+    {
+        filesystem[0] = 'F';
+        filesystem[1] = 'A';
+        filesystem[2] = 'T';
+        filesystem[3] = '1';
+        filesystem[4] = '2';
+        filesystem[5] = '\0';
+    }
+    if (!strings_equal(filesystem, "FAT12") &&
+        !strings_equal(filesystem, "FAT16") &&
+        !strings_equal(filesystem, "FAT32"))
+    {
+        print("Choose FAT12, FAT16, or FAT32.");
+        return;
+    }
+    if (!fat_can_format(
+            (uint8_t)(strings_equal(filesystem, "FAT12") ? FAT_TYPE_12 :
+                strings_equal(filesystem, "FAT16") ? FAT_TYPE_16 :
+                FAT_TYPE_32), size_mib * 2048u))
+    {
+        print("\nThat partition size is not supported by the selected FAT type.");
+        print("\nChoose another size or filesystem; the disk was not changed.");
+        return;
+    }
+
+    partition_type = strings_equal(filesystem, "FAT12") ? 0x01 :
+        strings_equal(filesystem, "FAT16") ? 0x06 : 0x0C;
+    print("\n\nReview:");
+    print("\nDisk: ");
+    print_dec32(drive);
+    print("\nPartition: ");
+    print_dec32(partition_slot + 1);
+    print("\nSize: ");
+    print_dec32(size_mib);
+    print(" MiB");
+    print("\nFilesystem: ");
+    print(filesystem);
+    print("\nStarting at: ");
+    print_dec32(start_lba / 2048u);
+    print(" MiB");
+    print("\nFormatting will erase data in the new partition.");
+    if (!prompt_line("\nType CONFIRM to create and format, or anything else to cancel: ",
+                     text, sizeof(text)))
+        return;
+    parsed = text;
+    if (!parse_confirmation(&parsed) || !no_more_arguments(parsed))
+    {
+        print("Cancelled.");
+        return;
+    }
+
+    if (!mbr_create_partition(&mbr, drive, (uint8_t)partition_slot,
+            partition_type, start_lba, size_mib * 2048u) ||
+        !mbr_write(drive, &mbr))
+    {
+        print("\nPartition table update failed; formatting was not attempted.");
+        return;
+    }
+    selected_disk = drive;
+    current_directory[0] = '\0';
+    if (!vfs_format_disk(drive, (uint8_t)partition_slot, filesystem))
+    {
+        print("\nPartition was created but formatting failed.");
+        print("\nUse partlist to inspect it; no existing partition was changed.");
+        return;
+    }
+    print("\nPartition created, formatted, and mounted successfully.");
 }
 
 static void command_mount(const char* args)
@@ -1172,22 +1632,20 @@ static void command_remove_directory(const char* args)
 static void command_diskzero(const char* args)
 {
     uint32_t drive;
-    uint32_t sector_count;
-    uint32_t lba;
-    uint32_t progress_quantum;
-    uint32_t progress_remainder;
-    uint32_t next_progress_lba;
-    uint32_t next_percent = 1;
+    uint64_t sector_count;
+    uint64_t lba;
+    uint64_t progress_quantum;
+    uint64_t next_progress_lba;
     uint8_t zero_sector[512] = { 0 };
     const char* confirmation = args;
 
     if (!parse_number(&confirmation, &drive) ||
         !parse_confirmation(&confirmation) ||
         !no_more_arguments(confirmation) ||
-        drive >= 4)
+        drive >= DISK_MAX_DEVICES)
     {
         print("\nUsage: diskzero DRIVE CONFIRM");
-        print("\nDRIVE must be the selected disk ID (0-3).");
+        print("\nDRIVE must be the selected disk ID.");
         return;
     }
 
@@ -1207,41 +1665,34 @@ static void command_diskzero(const char* args)
     vfs_unmount();
     print("\n!!! PERMANENT DATA DESTRUCTION !!!");
     print("\nThis will write zeros to every sector on disk ");
-    print_char('0' + selected_disk);
+    print_dec32(selected_disk);
     print(" (");
-    print_dec32(sector_count / 2048);
+    print_dec64(sector_count >> 11);
     print(" MiB).");
     print("\nAll partitions, filesystems, boot code, and data will be lost.");
     print("\nStarting full disk erase...");
 
-    progress_quantum = sector_count / 100;
-    progress_remainder = sector_count % 100;
-    next_progress_lba = progress_quantum +
-        ((progress_remainder + 99) / 100);
+    progress_quantum = sector_count >> 7;
+    if (sector_count & 0x7Fu)
+        progress_quantum++;
+    if (progress_quantum == 0)
+        progress_quantum = 1;
+    next_progress_lba = progress_quantum;
 
     for (lba = 0; lba < sector_count; lba++)
     {
         if (!disk_write_sector_on_drive(selected_disk, lba, zero_sector))
         {
             print("\nDisk erase failed at LBA ");
-            print_dec32(lba);
+            print_dec64(lba);
             print(". Disk may be partially erased.");
             return;
         }
 
-        if (sector_count >= 100 && lba + 1 >= next_progress_lba)
+        if (sector_count >= 128 && lba + 1 >= next_progress_lba)
         {
-            print("\nProgress: ");
-            print_dec32(next_percent);
-            print("%");
-
-            next_percent++;
-            if (next_percent <= 100)
-            {
-                next_progress_lba =
-                    progress_quantum * next_percent +
-                    (progress_remainder * next_percent + 99) / 100;
-            }
+            print_char('.');
+            next_progress_lba += progress_quantum;
         }
     }
 
@@ -1255,10 +1706,11 @@ static void command_help(void)
     print("\nshutdown / clhis");
     print("\ndisks / disk DRIVE / mbr / partlist");
     print("\nmbrinit CONFIRM / mbrwritetest CONFIRM");
-    print("\npartcreate SLOT TYPE START_MB SIZE_MB CONFIRM");
-    print("\npartdelete SLOT CONFIRM / partactive SLOT CONFIRM");
-    print("\nformat PARTITION [FAT12|FAT16|FAT32] CONFIRM");
-    print("\nformatdisk DRIVE PARTITION FAT12|FAT16|FAT32 CONFIRM");
+    print("\npartcreate [DRIVE] SLOT TYPE START_MB SIZE_MB CONFIRM");
+    print("\npartdelete [DRIVE] SLOT CONFIRM / partactive [DRIVE] SLOT CONFIRM");
+    print("\nformat PARTITION(1-4) [FAT12|FAT16|FAT32] CONFIRM (selected disk)");
+    print("\nformatdisk DRIVE PARTITION(1-4) FAT12|FAT16|FAT32 CONFIRM");
+    print("\nformatwizard (guided new partition and format setup)");
     print("\nmount PARTITION / umount");
     print("\ncd [DIR] / ls [DIR] / dir [DIR]");
     print("\nmkdir DIR / rmdir DIR");
@@ -1290,7 +1742,7 @@ static void execute_command(char* input, int length)
     }
     else if (strings_equal(input, "ver"))
     {
-        print("\nnnos Kernel v0.0.2");
+        print("\nnnos Kernel v0.0.3");
     }
     else if (strings_equal(input, "help"))
     {
@@ -1346,6 +1798,10 @@ static void execute_command(char* input, int length)
     else if (starts_command(input, "formatdisk"))
     {
         command_format_disk(input + 10);
+    }
+    else if (strings_equal(input, "formatwizard"))
+    {
+        command_format_wizard();
     }
     else if (starts_command(input, "format"))
     {
@@ -1429,7 +1885,7 @@ void init_c(void)
     disable_cursor();
     cls();
 
-    print("nnos Kernel v0.0.2\n");
+    print("nnos Kernel v0.0.3\n");
     current_directory[0] = '\0';
     print("nnos:/> ");
 

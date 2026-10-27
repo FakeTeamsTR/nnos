@@ -24,7 +24,7 @@ typedef struct __attribute__((packed))
 } MBR;
 
 int mbr_read(uint8_t drive, MBR *mbr);
-int mbr_validate(const MBR *mbr, uint32_t disk_sector_count);
+int mbr_validate(const MBR *mbr, uint64_t disk_sector_count);
 int mbr_initialize(uint8_t drive);
 int mbr_write(uint8_t drive, const MBR *mbr);
 int mbr_create_partition(
@@ -36,6 +36,6 @@ int mbr_create_partition(
     uint32_t sector_count
 );
 int mbr_delete_partition(MBR *mbr, uint8_t slot);
-int mbr_set_active(MBR *mbr, uint8_t slot, uint32_t disk_sector_count);
+int mbr_set_active(MBR *mbr, uint8_t slot, uint64_t disk_sector_count);
 
 #endif

@@ -67,14 +67,13 @@ int vfs_format_partition_as(
     const char* filesystem)
 {
     MBR mbr;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
     PartitionEntry* partition;
     uint8_t type = filesystem_type(filesystem);
     uint8_t partition_type;
 
-    vfs_unmount();
-
-    if (type == 0 || drive >= 4 || slot >= MBR_PARTITION_COUNT ||
+    if (type == 0 || drive >= DISK_MAX_DEVICES ||
+        slot >= MBR_PARTITION_COUNT ||
         !mbr_read(drive, &mbr) ||
         !disk_get_sector_count(drive, &disk_sector_count) ||
         !mbr_validate(&mbr, disk_sector_count))
@@ -85,6 +84,8 @@ int vfs_format_partition_as(
         is_unsupported_partition_type(partition->type) ||
         !fat_can_format(type, partition->sector_count))
         return 0;
+
+    vfs_unmount();
 
     if (!fat_format(
             drive, partition->lba_start, partition->sector_count, type))
@@ -116,12 +117,12 @@ int vfs_format_disk(uint8_t drive, uint8_t slot, const char* filesystem)
 int vfs_mount_partition(uint8_t drive, uint8_t slot)
 {
     MBR mbr;
-    uint32_t disk_sector_count;
+    uint64_t disk_sector_count;
     PartitionEntry* partition;
 
     vfs_unmount();
 
-    if (drive >= 4 || slot >= MBR_PARTITION_COUNT ||
+    if (drive >= DISK_MAX_DEVICES || slot >= MBR_PARTITION_COUNT ||
         !mbr_read(drive, &mbr) ||
         !disk_get_sector_count(drive, &disk_sector_count) ||
         !mbr_validate(&mbr, disk_sector_count))

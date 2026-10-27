@@ -1,5 +1,7 @@
 #include "types.h"
 #include "disk.h"
+#include "usb_uhci.h"
+#include "usb_hcd.h"
 
 #define ATA_PRIMARY_BASE   0x1F0
 #define ATA_SECONDARY_BASE 0x170
@@ -20,16 +22,18 @@
 #define ATA_CMD_WRITE_PIO 0x30
 #define ATA_CMD_IDENTIFY  0xEC
 #define ATA_CMD_FLUSH     0xE7
+#define ATA_CMD_FLUSH_EXT 0xEA
+#define ATA_CMD_READ_EXT  0x24
+#define ATA_CMD_WRITE_EXT 0x34
 
 #define ATA_SR_BSY  0x80
 #define ATA_SR_DRQ  0x08
 #define ATA_SR_ERR  0x01
 #define ATA_SR_DF   0x20
 
-#define ATA_LBA28_SECTORS 0x10000000u
-
-static uint32_t cached_sector_count[4];
+static uint64_t cached_sector_count[4];
 static uint8_t cache_valid[4];
+static uint8_t cached_lba48[4];
 
 static uint8_t inb(uint16_t port)
 {
@@ -135,6 +139,14 @@ static int ata_wait_drq(uint8_t drive)
     return 0;
 }
 
+static int identify_uses_512_byte_logical_sectors(const uint16_t* identify)
+{
+    uint16_t sector_info = identify[106];
+
+    return (sector_info & 0xC000u) != 0x4000u ||
+           !(sector_info & 0x1000u);
+}
+
 static int ata_select(uint8_t drive, uint8_t lba_mode)
 {
     uint16_t base = ata_base(drive);
@@ -149,16 +161,24 @@ static int ata_select(uint8_t drive, uint8_t lba_mode)
     return ata_wait_not_busy(drive);
 }
 
-int disk_get_sector_count(uint8_t drive, uint32_t *sector_count)
+int disk_get_sector_count(uint8_t drive, uint64_t *sector_count)
 {
     uint16_t identify[256];
     uint16_t base;
-    uint32_t sectors;
+    uint64_t sectors;
     uint16_t i;
     uint8_t status;
 
-    if (drive >= 4 || sector_count == 0)
+    if (drive >= DISK_MAX_DEVICES || sector_count == 0)
         return 0;
+
+    if (drive >= OHCI_DRIVE_BASE)
+        return usb_hcd_storage_sector_count(drive, sector_count);
+    if (drive >= USB_DRIVE_BASE)
+        return usb_uhci_storage_sector_count(drive, sector_count);
+
+    if (drive >= AHCI_DRIVE_BASE)
+        return ahci_get_sector_count(drive, sector_count);
 
     if (cache_valid[drive])
     {
@@ -197,15 +217,30 @@ int disk_get_sector_count(uint8_t drive, uint32_t *sector_count)
 
     if (!(identify[49] & 0x0200))
         return 0;
+    if (!identify_uses_512_byte_logical_sectors(identify))
+        return 0;
 
-    sectors = (uint32_t)identify[60] |
-              ((uint32_t)identify[61] << 16);
+    if ((identify[83] & 0xC000) == 0x4000 &&
+        (identify[83] & 0x0400))
+    {
+        sectors = (uint64_t)identify[100] |
+                  ((uint64_t)identify[101] << 16) |
+                  ((uint64_t)identify[102] << 32) |
+                  ((uint64_t)identify[103] << 48);
+        sectors &= 0x0000FFFFFFFFFFFFull;
+        cached_lba48[drive] = 1;
+    }
+    else
+    {
+        sectors = (uint32_t)identify[60] |
+                  ((uint32_t)identify[61] << 16);
+        cached_lba48[drive] = 0;
+    }
 
     if (sectors == 0)
         return 0;
-
-    if (sectors > ATA_LBA28_SECTORS)
-        sectors = ATA_LBA28_SECTORS;
+    if (sectors > (1ull << 48))
+        return 0;
 
     cached_sector_count[drive] = sectors;
     cache_valid[drive] = 1;
@@ -213,23 +248,36 @@ int disk_get_sector_count(uint8_t drive, uint32_t *sector_count)
     return 1;
 }
 
-static int ata_prepare_lba(uint8_t drive, uint32_t lba)
+static int ata_prepare_lba(uint8_t drive, uint64_t lba)
 {
     uint16_t base = ata_base(drive);
-    uint32_t sector_count;
+    uint64_t sector_count;
+    uint8_t lba48;
 
-    if (drive >= 4 || lba > 0x0FFFFFFF ||
+    if (drive >= 4 ||
         !disk_get_sector_count(drive, &sector_count) ||
         lba >= sector_count)
         return 0;
 
-    outb(base + ATA_DRIVE,
-         (uint8_t)(0xE0 | ((drive & 1) << 4) | ((lba >> 24) & 0x0F)));
+    lba48 = cached_lba48[drive];
+    if (!lba48 && lba > 0x0FFFFFFF)
+        return 0;
+
+    outb(base + ATA_DRIVE, (uint8_t)(
+        (lba48 ? 0x40 : 0xE0) | ((drive & 1) << 4) |
+        (lba48 ? 0 : ((lba >> 24) & 0x0F))));
     ata_delay_400ns(drive);
 
     if (!ata_wait_not_busy(drive))
         return 0;
 
+    if (lba48)
+    {
+        outb(base + ATA_SECCOUNT0, 0);
+        outb(base + ATA_LBA_LOW, (uint8_t)(lba >> 24));
+        outb(base + ATA_LBA_MID, (uint8_t)(lba >> 32));
+        outb(base + ATA_LBA_HIGH, (uint8_t)(lba >> 40));
+    }
     outb(base + ATA_SECCOUNT0, 1);
     outb(base + ATA_LBA_LOW, (uint8_t)lba);
     outb(base + ATA_LBA_MID, (uint8_t)(lba >> 8));
@@ -237,17 +285,29 @@ static int ata_prepare_lba(uint8_t drive, uint32_t lba)
     return 1;
 }
 
-int disk_read_sector_on_drive(uint8_t drive, uint32_t lba, uint8_t *buffer)
+int disk_read_sector_on_drive(uint8_t drive, uint64_t lba, uint8_t *buffer)
 {
     uint16_t base;
     uint16_t i;
     uint8_t status;
 
-    if (buffer == 0 || !ata_prepare_lba(drive, lba))
+    if (buffer == 0 || drive >= DISK_MAX_DEVICES)
+        return 0;
+
+    if (drive >= OHCI_DRIVE_BASE)
+        return usb_hcd_storage_read(drive, lba, buffer);
+    if (drive >= USB_DRIVE_BASE)
+        return usb_uhci_storage_read(drive, lba, buffer);
+
+    if (drive >= AHCI_DRIVE_BASE)
+        return ahci_read_sector(drive, lba, buffer);
+
+    if (!ata_prepare_lba(drive, lba))
         return 0;
 
     base = ata_base(drive);
-    outb(base + ATA_COMMAND, ATA_CMD_READ_PIO);
+    outb(base + ATA_COMMAND, cached_lba48[drive] ?
+         ATA_CMD_READ_EXT : ATA_CMD_READ_PIO);
 
     if (!ata_wait_drq(drive))
         return 0;
@@ -269,18 +329,30 @@ int disk_read_sector_on_drive(uint8_t drive, uint32_t lba, uint8_t *buffer)
 
 int disk_write_sector_on_drive(
     uint8_t drive,
-    uint32_t lba,
+    uint64_t lba,
     const uint8_t *buffer)
 {
     uint16_t base;
     uint16_t i;
     uint8_t status;
 
-    if (buffer == 0 || !ata_prepare_lba(drive, lba))
+    if (buffer == 0 || drive >= DISK_MAX_DEVICES)
+        return 0;
+
+    if (drive >= OHCI_DRIVE_BASE)
+        return usb_hcd_storage_write(drive, lba, buffer);
+    if (drive >= USB_DRIVE_BASE)
+        return usb_uhci_storage_write(drive, lba, buffer);
+
+    if (drive >= AHCI_DRIVE_BASE)
+        return ahci_write_sector(drive, lba, buffer);
+
+    if (!ata_prepare_lba(drive, lba))
         return 0;
 
     base = ata_base(drive);
-    outb(base + ATA_COMMAND, ATA_CMD_WRITE_PIO);
+    outb(base + ATA_COMMAND, cached_lba48[drive] ?
+         ATA_CMD_WRITE_EXT : ATA_CMD_WRITE_PIO);
 
     if (!ata_wait_drq(drive))
         return 0;
@@ -301,7 +373,8 @@ int disk_write_sector_on_drive(
     if (status & (ATA_SR_ERR | ATA_SR_DF))
         return 0;
 
-    outb(base + ATA_COMMAND, ATA_CMD_FLUSH);
+    outb(base + ATA_COMMAND, cached_lba48[drive] ?
+         ATA_CMD_FLUSH_EXT : ATA_CMD_FLUSH);
 
     if (!ata_wait_not_busy(drive))
         return 0;
@@ -310,12 +383,12 @@ int disk_write_sector_on_drive(
     return !(status & (ATA_SR_ERR | ATA_SR_DF));
 }
 
-int disk_read_sector(uint32_t lba, uint8_t *buffer)
+int disk_read_sector(uint64_t lba, uint8_t *buffer)
 {
     return disk_read_sector_on_drive(0, lba, buffer);
 }
 
-int disk_write_sector(uint32_t lba, const uint8_t *buffer)
+int disk_write_sector(uint64_t lba, const uint8_t *buffer)
 {
     return disk_write_sector_on_drive(0, lba, buffer);
 }

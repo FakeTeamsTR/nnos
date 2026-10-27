@@ -34,11 +34,11 @@ typedef struct
     uint16_t root_entries;
     uint32_t fat_sectors;
     uint32_t root_cluster;
-    uint32_t volume_start;
+    uint64_t volume_start;
     uint32_t total_sectors;
-    uint32_t root_start;
+    uint64_t root_start;
     uint32_t root_sectors;
-    uint32_t data_start;
+    uint64_t data_start;
     uint32_t cluster_count;
 } Fat12Volume;
 
@@ -66,12 +66,25 @@ static Fat12Volume volume;
 static uint8_t sector_buffer[FAT12_SECTOR_SIZE];
 static uint8_t root_cache[FAT12_SECTOR_SIZE];
 static uint32_t cluster_buffer[FAT_ALLOC_MAX_CLUSTERS];
-static uint32_t root_cache_lba = 0xFFFFFFFFu;
+static uint64_t root_cache_lba = 0xFFFFFFFFFFFFFFFFull;
 
 static int resolve_directory(const char* path, uint32_t* cluster);
 static int make_short_name(const char* name, uint8_t output[11]);
 static int get_fat_entry(uint32_t cluster, uint32_t* value);
 static int fat_is_end(uint32_t value);
+
+static int is_valid_data_cluster(uint32_t cluster)
+{
+    if (cluster < 2 || cluster >= volume.cluster_count + 2)
+        return 0;
+
+    if ((volume.type == FAT_TYPE_12 && cluster >= 0x0FF0u) ||
+        (volume.type == FAT_TYPE_16 && cluster >= 0xFFF0u) ||
+        (volume.type == FAT_TYPE_32 && cluster >= 0x0FFFFFF0u))
+        return 0;
+
+    return 1;
+}
 
 static uint16_t read_le16(const uint8_t* data)
 {
@@ -216,7 +229,7 @@ int fat_can_format(uint8_t filesystem, uint32_t sector_count)
 
 static int zero_sectors(
     uint8_t drive,
-    uint32_t start,
+    uint64_t start,
     uint32_t count,
     const char* label)
 {
@@ -261,15 +274,15 @@ int fat_format(
     uint32_t fat_sectors;
     uint32_t clusters;
     uint32_t root_sectors;
-    uint32_t root_start;
-    uint32_t first_fat;
-    uint32_t disk_sectors;
-    uint32_t partition_end;
-    uint32_t root_cluster_lba = 0;
+    uint64_t root_start;
+    uint64_t first_fat;
+    uint64_t disk_sectors;
+    uint64_t partition_end;
+    uint64_t root_cluster_lba = 0;
 
     fat12_unmount();
 
-    if (drive >= 4 || start_lba == 0 || sector_count == 0 ||
+    if (drive >= DISK_MAX_DEVICES || start_lba == 0 || sector_count == 0 ||
         !disk_get_sector_count(drive, &disk_sectors) ||
         start_lba >= disk_sectors ||
         sector_count > disk_sectors - start_lba ||
@@ -282,9 +295,9 @@ int fat_format(
         FAT12_MAX_ROOT_ENTRIES :
         filesystem == FAT_TYPE_16 ? 512 : 0;
     root_sectors = sectors_for_root(root_entries);
-    first_fat = start_lba + reserved;
+    first_fat = (uint64_t)start_lba + reserved;
     root_start = first_fat + fat_sectors * 2;
-    partition_end = start_lba + sector_count;
+    partition_end = (uint64_t)start_lba + sector_count;
     if (filesystem == FAT_TYPE_32)
         root_cluster_lba = root_start;
 
@@ -295,7 +308,8 @@ int fat_format(
         return 0;
 
     if (!zero_sectors(
-            drive, start_lba + 1, reserved - 1, "Clearing reserved sectors") ||
+        drive, (uint64_t)start_lba + 1,
+        reserved - 1, "Clearing reserved sectors") ||
         !zero_sectors(
             drive, first_fat, fat_sectors * 2, "Clearing FAT tables") ||
         !zero_sectors(
@@ -396,9 +410,12 @@ int fat_format(
 
     if (filesystem == FAT_TYPE_32)
     {
-        if (!disk_write_sector_on_drive(drive, start_lba + 1, fsinfo) ||
-            !disk_write_sector_on_drive(drive, start_lba + 6, boot) ||
-            !disk_write_sector_on_drive(drive, start_lba + 7, fsinfo))
+        if (!disk_write_sector_on_drive(
+                drive, (uint64_t)start_lba + 1, fsinfo) ||
+            !disk_write_sector_on_drive(
+                drive, (uint64_t)start_lba + 6, boot) ||
+            !disk_write_sector_on_drive(
+                drive, (uint64_t)start_lba + 7, fsinfo))
             return 0;
     }
 
@@ -416,7 +433,7 @@ int fat12_mount(
     uint32_t partition_sector_count)
 {
     uint8_t boot[FAT12_SECTOR_SIZE];
-    uint32_t disk_sectors;
+    uint64_t disk_sectors;
     uint32_t total_sectors;
     uint32_t root_sectors;
     uint32_t root_start;
@@ -434,7 +451,8 @@ int fat12_mount(
 
     fat12_unmount();
 
-    if (drive >= 4 || start_lba == 0 || partition_sector_count == 0 ||
+    if (drive >= DISK_MAX_DEVICES || start_lba == 0 ||
+        partition_sector_count == 0 ||
         !disk_get_sector_count(drive, &disk_sectors) ||
         start_lba >= disk_sectors ||
         partition_sector_count > disk_sectors - start_lba ||
@@ -491,12 +509,13 @@ int fat12_mount(
          (root_entries != 0 || read_le16(&boot[22]) != 0 ||
           ((fat_flags & 0x0080u) &&
            (fat_flags & 0x000Fu) >= fat_count) ||
-          root_cluster < 2 || root_cluster >= clusters + 2)))
+          root_cluster < 2 || root_cluster >= clusters + 2 ||
+          root_cluster >= 0x0FFFFFF0u)))
         return 0;
 
     if (!disk_read_sector_on_drive(
             drive,
-            start_lba + reserved +
+            (uint64_t)start_lba + reserved +
                 ((type == FAT_TYPE_32 && (fat_flags & 0x0080u)) ?
                  (uint32_t)(fat_flags & 0x000Fu) * fat_sectors : 0),
             sector_buffer))
@@ -537,19 +556,18 @@ int fat12_mount(
     volume.root_cluster = root_cluster;
     volume.volume_start = start_lba;
     volume.total_sectors = total_sectors;
-    volume.root_start = start_lba + root_start;
+    volume.root_start = (uint64_t)start_lba + root_start;
     volume.root_sectors = root_sectors;
-    volume.data_start = start_lba + data_start;
+    volume.data_start = (uint64_t)start_lba + data_start;
     volume.cluster_count = clusters;
-    root_cache_lba = 0xFFFFFFFFu;
+    root_cache_lba = 0xFFFFFFFFFFFFFFFFull;
 
     if (type == FAT_TYPE_32)
     {
         uint32_t root_entry;
         if (!get_fat_entry(root_cluster, &root_entry) ||
-            (root_entry < 2 && !fat_is_end(root_entry)) ||
             (!fat_is_end(root_entry) &&
-             root_entry >= volume.cluster_count + 2))
+             !is_valid_data_cluster(root_entry)))
         {
             fat12_unmount();
             return 0;
@@ -562,7 +580,7 @@ int fat12_mount(
 void fat12_unmount(void)
 {
     volume.mounted = 0;
-    root_cache_lba = 0xFFFFFFFFu;
+    root_cache_lba = 0xFFFFFFFFFFFFFFFFull;
 }
 
 int fat12_is_mounted(void)
@@ -577,7 +595,7 @@ uint8_t fat_mounted_type(void)
 
 static int read_fat_byte(uint32_t offset, uint8_t* value)
 {
-    uint32_t lba;
+    uint64_t lba;
 
     if (!volume.mounted ||
         offset >= (uint32_t)volume.fat_sectors * FAT12_SECTOR_SIZE)
@@ -593,9 +611,9 @@ static int read_fat_byte(uint32_t offset, uint8_t* value)
     return 1;
 }
 
-static int write_fat_byte(uint32_t fat_start, uint32_t offset, uint8_t value)
+static int write_fat_byte(uint64_t fat_start, uint32_t offset, uint8_t value)
 {
-    uint32_t lba;
+    uint64_t lba;
     uint16_t sector_offset;
 
     if (offset >= (uint32_t)volume.fat_sectors * FAT12_SECTOR_SIZE)
@@ -619,7 +637,7 @@ static int get_fat_entry(uint32_t cluster, uint32_t* value)
     uint8_t i;
 
     if (!volume.mounted || value == 0 ||
-        cluster < 2 || cluster >= volume.cluster_count + 2)
+        !is_valid_data_cluster(cluster))
         return 0;
 
     if (volume.type == FAT_TYPE_12)
@@ -637,8 +655,7 @@ static int get_fat_entry(uint32_t cluster, uint32_t* value)
             return 0;
     }
 
-    if (!volume.mounted ||
-        cluster < 2 || cluster >= volume.cluster_count + 2)
+    if (!volume.mounted || !is_valid_data_cluster(cluster))
         return 0;
 
     if (volume.type == FAT_TYPE_12)
@@ -669,8 +686,11 @@ static int set_fat_entry(uint32_t cluster, uint32_t value)
     uint8_t new_bytes[4];
     uint8_t count;
     uint8_t i;
-    uint32_t first_fat =
+    uint64_t first_fat =
         volume.volume_start + volume.reserved_sectors;
+
+    if (!volume.mounted || !is_valid_data_cluster(cluster))
+        return 0;
 
     if (volume.type == FAT_TYPE_12)
         offset = cluster + cluster / 2;
@@ -721,7 +741,7 @@ static int set_fat_entry(uint32_t cluster, uint32_t value)
                      (uint32_t)volume.active_fat + 1);
          fat_copy++)
     {
-        uint32_t fat_start =
+        uint64_t fat_start =
             first_fat + fat_copy * volume.fat_sectors;
 
         for (i = 0; i < count; i++)
@@ -754,12 +774,11 @@ static int fat_is_bad(uint32_t value)
            value == 0x0FFFFFF7u;
 }
 
-static int cluster_to_lba(uint32_t cluster, uint32_t* lba)
+static int cluster_to_lba(uint32_t cluster, uint64_t* lba)
 {
     uint32_t offset;
 
-    if (!volume.mounted || cluster < 2 ||
-        cluster >= volume.cluster_count + 2)
+    if (!volume.mounted || !is_valid_data_cluster(cluster))
         return 0;
 
     offset = (uint32_t)(cluster - 2) * volume.sectors_per_cluster;
@@ -790,9 +809,9 @@ static int read_raw_directory_entry(
     Fat12RawDirectoryEntry* entry)
 {
     uint32_t byte_offset;
-    uint32_t lba;
+    uint64_t lba;
     uint16_t sector_offset;
-    uint32_t directory_lba;
+    uint64_t directory_lba;
     uint32_t entries_per_cluster =
         (uint32_t)volume.sectors_per_cluster * 16;
     uint32_t cluster_offset;
@@ -816,10 +835,8 @@ static int read_raw_directory_entry(
         {
             uint32_t next;
             if (!get_fat_entry(cluster, &next) ||
-                next >= (volume.type == FAT_TYPE_12 ? 0x0FF8u :
-                         volume.type == FAT_TYPE_16 ? 0xFFF8u :
-                         0x0FFFFFF8u) ||
-                next < 2 || next >= volume.cluster_count + 2)
+                fat_is_end(next) || fat_is_bad(next) ||
+                !is_valid_data_cluster(next))
                 return 0;
             cluster = next;
         }
@@ -856,8 +873,8 @@ static int write_raw_directory_entry(
     const Fat12RawDirectoryEntry* entry)
 {
     uint32_t byte_offset;
-    uint32_t lba;
-    uint32_t directory_lba;
+    uint64_t lba;
+    uint64_t directory_lba;
     uint32_t entries_per_cluster =
         (uint32_t)volume.sectors_per_cluster * 16;
     uint32_t cluster_offset;
@@ -884,10 +901,8 @@ static int write_raw_directory_entry(
         {
             uint32_t next;
             if (!get_fat_entry(cluster, &next) ||
-                next >= (volume.type == FAT_TYPE_12 ? 0x0FF8u :
-                         volume.type == FAT_TYPE_16 ? 0xFFF8u :
-                         0x0FFFFFF8u) ||
-                next < 2 || next >= volume.cluster_count + 2)
+                fat_is_end(next) || fat_is_bad(next) ||
+                !is_valid_data_cluster(next))
                 return 0;
             cluster = next;
         }
@@ -913,7 +928,7 @@ static int write_raw_directory_entry(
 
     if (!disk_write_sector_on_drive(volume.drive, lba, root_cache))
     {
-        root_cache_lba = 0xFFFFFFFFu;
+        root_cache_lba = 0xFFFFFFFFFFFFFFFFull;
         return 0;
     }
 
@@ -1140,8 +1155,7 @@ static int resolve_directory(const char* path, uint32_t* cluster)
                 current, short_name, &entry_index, &entry, &free_index) ||
             entry.name[0] == 0 ||
             !(entry.attributes & FAT12_ATTR_DIRECTORY) ||
-            directory_entry_cluster(&entry) < 2 ||
-            directory_entry_cluster(&entry) >= volume.cluster_count + 2)
+            !is_valid_data_cluster(directory_entry_cluster(&entry)))
             return 0;
 
         current = directory_entry_cluster(&entry);
@@ -1274,19 +1288,21 @@ static int free_cluster_chain(uint32_t first_cluster)
     uint32_t cluster = first_cluster;
     uint32_t traversed = 0;
 
-    while (cluster >= 2 && cluster < volume.cluster_count + 2)
+    while (is_valid_data_cluster(cluster))
     {
         uint32_t next;
 
         if (++traversed > volume.cluster_count ||
-            !get_fat_entry(cluster, &next) ||
-            !set_fat_entry(cluster, 0))
+            !get_fat_entry(cluster, &next))
             return 0;
 
         if (fat_is_end(next))
-            return 1;
+            return set_fat_entry(cluster, 0);
 
-        if (fat_is_bad(next) || next < 2)
+        if (fat_is_bad(next) || !is_valid_data_cluster(next))
+            return 0;
+
+        if (!set_fat_entry(cluster, 0))
             return 0;
 
         cluster = next;
@@ -1325,7 +1341,7 @@ int fat12_read_file(
     cluster = directory_entry_cluster(&entry);
     while (copied < entry.size)
     {
-        uint32_t lba;
+        uint64_t lba;
         uint8_t sector;
 
         if (++steps > volume.cluster_count ||
@@ -1349,8 +1365,8 @@ int fat12_read_file(
         {
             uint32_t next;
             if (!get_fat_entry(cluster, &next) ||
-                fat_is_end(next) || fat_is_bad(next) || next < 2 ||
-                next >= volume.cluster_count + 2)
+                fat_is_end(next) || fat_is_bad(next) ||
+                !is_valid_data_cluster(next))
                 return 0;
             cluster = next;
         }
@@ -1376,6 +1392,9 @@ static int find_free_clusters(
     {
         uint32_t value;
         uint32_t cluster = i + 2;
+
+        if (!is_valid_data_cluster(cluster))
+            continue;
 
         if (!get_fat_entry(cluster, &value))
             return 0;
@@ -1442,7 +1461,7 @@ static int write_file_internal(
 
     for (i = 0; i < needed; i++)
     {
-        uint32_t lba;
+        uint64_t lba;
         uint8_t sector;
         uint32_t cluster_bytes =
             (uint32_t)volume.sectors_per_cluster * FAT12_SECTOR_SIZE;
@@ -1569,7 +1588,7 @@ int fat12_create_directory(const char* path)
     Fat12RawDirectoryEntry dotdot;
     uint8_t* entry_bytes;
     uint16_t i;
-    uint32_t lba;
+    uint64_t lba;
     uint8_t sector;
 
     if (!volume.mounted ||
@@ -1655,8 +1674,7 @@ int fat12_delete_directory(const char* path)
         return 0;
 
     directory_cluster = directory_entry_cluster(&entry);
-    if (directory_cluster < 2 ||
-        directory_cluster >= volume.cluster_count + 2)
+    if (!is_valid_data_cluster(directory_cluster))
         return 0;
 
     for (i = 0; i < directory_entry_capacity(directory_cluster); i++)

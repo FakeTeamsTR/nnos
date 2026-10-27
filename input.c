@@ -1,5 +1,7 @@
 #include "types.h"
 #include "input.h"
+#include "usb_uhci.h"
+#include "usb_hcd.h"
 
 #define PS2_DATA   0x60
 #define PS2_STATUS 0x64
@@ -19,25 +21,30 @@ static uint8_t inb(uint16_t port)
     return value;
 }
 
-static uint8_t keyboard_read_scancode(void)
-{
-    while (!(inb(PS2_STATUS) & 1))
-        ;
-
-    return inb(PS2_DATA);
-}
-
 char input_api(void)
 {
     uint8_t scancode;
 
     while (1)
     {
-        scancode = keyboard_read_scancode();
+        char usb_key;
+
+        usb_hcd_poll();
+        if (usb_hcd_keyboard_poll(&usb_key))
+            return usb_key;
+        if (usb_uhci_keyboard_poll(&usb_key))
+            return usb_key;
+
+        if (!(inb(PS2_STATUS) & 1))
+            continue;
+
+        scancode = inb(PS2_DATA);
 
         if (scancode == 0xE0)
         {
-            scancode = keyboard_read_scancode();
+            while (!(inb(PS2_STATUS) & 1))
+                ;
+            scancode = inb(PS2_DATA);
 
             if (scancode == 0x48)
                 return KEY_UP;

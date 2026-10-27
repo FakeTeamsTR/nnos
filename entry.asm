@@ -13,6 +13,10 @@ global start
 extern ASMTOC
 
 start:
+    cli
+    cld
+    mov esp, stack_top
+    mov ebp, esp
     mov edi, 0xB8000
     call ASMTOC
 
@@ -20,3 +24,9 @@ hang:
     cli
     hlt
     jmp hang
+
+section .bss
+align 16
+stack_bottom:
+    resb 16384
+stack_top:

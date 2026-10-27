@@ -7,20 +7,47 @@ extern void cls(void);
 int cursor_x = 0;
 int cursor_y = 0;
 
+static void scroll_screen(void)
+{
+    volatile unsigned char* video =
+        (volatile unsigned char*)VGA_ADDRESS;
+    int i;
+
+    for (i = 0; i < (VGA_HEIGHT - 1) * VGA_WIDTH; i++)
+    {
+        video[i * 2] = video[(i + VGA_WIDTH) * 2];
+        video[i * 2 + 1] = video[(i + VGA_WIDTH) * 2 + 1];
+    }
+
+    for (i = (VGA_HEIGHT - 1) * VGA_WIDTH;
+         i < VGA_HEIGHT * VGA_WIDTH;
+         i++)
+    {
+        video[i * 2] = ' ';
+        video[i * 2 + 1] = 0x07;
+    }
+
+    cursor_y = VGA_HEIGHT - 1;
+}
+
+static void advance_line(void)
+{
+    cursor_x = 0;
+    cursor_y++;
+
+    if (cursor_y >= VGA_HEIGHT)
+        scroll_screen();
+}
+
 void print(const char* str)
 {
-    unsigned char* video = (unsigned char*)VGA_ADDRESS;
+    volatile unsigned char* video =
+        (volatile unsigned char*)VGA_ADDRESS;
 
     while (*str)
     {
         if (*str == '\n')
-        {
-            cursor_x = 0;
-            cursor_y++;
-
-            if (cursor_y >= VGA_HEIGHT)
-                cls();
-        }
+            advance_line();
         else
         {
             int pos = (cursor_y * VGA_WIDTH + cursor_x) * 2;
@@ -31,13 +58,7 @@ void print(const char* str)
             cursor_x++;
 
             if (cursor_x >= VGA_WIDTH)
-            {
-                cursor_x = 0;
-                cursor_y++;
-
-                if (cursor_y >= VGA_HEIGHT)
-                    cls();
-            }
+                advance_line();
         }
 
         str++;
@@ -46,16 +67,12 @@ void print(const char* str)
 
 void print_char(char c)
 {
-    unsigned char* video = (unsigned char*)VGA_ADDRESS;
+    volatile unsigned char* video =
+        (volatile unsigned char*)VGA_ADDRESS;
 
     if (c == '\n')
     {
-        cursor_x = 0;
-        cursor_y++;
-
-        if (cursor_y >= VGA_HEIGHT)
-            cls();
-
+        advance_line();
         return;
     }
 
@@ -92,13 +109,7 @@ void print_char(char c)
     cursor_x++;
 
     if (cursor_x >= VGA_WIDTH)
-    {
-        cursor_x = 0;
-        cursor_y++;
-
-        if (cursor_y >= VGA_HEIGHT)
-            cls();
-    }
+        advance_line();
 }
 
 void set_cursor_position(int x, int y)
